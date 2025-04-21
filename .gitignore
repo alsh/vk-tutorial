@@ -1,0 +1,19 @@
+# Editor temporary files
+*~
+#*#
+.*.swp
+*.bak
+*.tmp
+
+# Build directory (common for Meson/CMake)
+build/
+builddir/
+
+# Compiled executables (adjust if needed)
+*.exe
+*.out
+a.out
+
+# Other common ignores
+.DS_Store
+Thumbs.db

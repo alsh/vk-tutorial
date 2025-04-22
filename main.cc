@@ -1,7 +1,9 @@
 #include <cstdint>
 #include <cstdlib>
 #include <iostream>
+#include <optional>
 #include <print>
+#include <set>
 #include <stdexcept>
 
 #define VULKAN_HPP_NO_CONSTRUCTORS
@@ -27,22 +29,39 @@ const bool enableValidationLayers = false;
 const bool enableValidationLayers = true;
 #endif
 
-uint32_t findGraphicsQueueFamilyIndex( std::vector<vk::QueueFamilyProperties> const & queueFamilyProperties )
+// Add this struct definition
+struct QueueFamilyIndices
 {
-  // get the first index into queueFamiliyProperties which supports graphics
-  std::vector<vk::QueueFamilyProperties>::const_iterator graphicsQueueFamilyProperty =
-    std::find_if( queueFamilyProperties.begin(),
-                  queueFamilyProperties.end(),
-                  []( vk::QueueFamilyProperties const & qfp ) { return qfp.queueFlags & vk::QueueFlagBits::eGraphics; } );
-  assert( graphicsQueueFamilyProperty != queueFamilyProperties.end() );
-  return static_cast<uint32_t>( std::distance( queueFamilyProperties.begin(), graphicsQueueFamilyProperty ) );
-}
+  std::optional<uint32_t> graphicsFamily;
+  std::optional<uint32_t> presentFamily;
+
+  bool isComplete() const { return graphicsFamily.has_value() && presentFamily.has_value(); }
+};
+
+// Add this struct definition
+struct QueueHandles
+{
+  vk::raii::Queue graphicsQueue = nullptr;
+  vk::raii::Queue presentQueue  = nullptr;
+};
+
+// Remove the old findGraphicsQueueFamilyIndex function
+// uint32_t findGraphicsQueueFamilyIndex( std::vector<vk::QueueFamilyProperties> const & queueFamilyProperties )
+// {
+//   // get the first index into queueFamiliyProperties which supports graphics
+//   std::vector<vk::QueueFamilyProperties>::const_iterator graphicsQueueFamilyProperty =
+//     std::find_if( queueFamilyProperties.begin(),
+//                   queueFamilyProperties.end(),
+//                   []( vk::QueueFamilyProperties const & qfp ) { return qfp.queueFlags & vk::QueueFlagBits::eGraphics; } );
+//   assert( graphicsQueueFamilyProperty != queueFamilyProperties.end() );
+//   return static_cast<uint32_t>( std::distance( queueFamilyProperties.begin(), graphicsQueueFamilyProperty ) );
+// }
 
 class HelloTriangleApplication
 {
 public:
   HelloTriangleApplication()
-    : instance( nullptr ), debug_messenger( nullptr ), device( nullptr ), logical_device( nullptr ), graphics_queue( nullptr ), surface( nullptr )
+    : instance( nullptr ), debug_messenger( nullptr ), surface( nullptr ), device( nullptr ), logical_device( nullptr )
   {
   }  // Initialize graphics_queue
 
@@ -55,6 +74,35 @@ public:
   }
 
 private:
+  // Add this function
+  QueueFamilyIndices findQueueFamilies( vk::raii::PhysicalDevice const & physical_device )
+  {
+    QueueFamilyIndices          indices;
+    auto                        queueFamilyProperties = physical_device.getQueueFamilyProperties();
+    uint32_t                    i                   = 0;
+    for ( const auto & queueFamily : queueFamilyProperties )
+    {
+      if ( queueFamily.queueFlags & vk::QueueFlagBits::eGraphics )
+      {
+        indices.graphicsFamily = i;
+      }
+
+      // Check for presentation support
+      VkBool32 presentSupport = physical_device.getSurfaceSupportKHR( i, *surface );
+      if ( presentSupport )
+      {
+        indices.presentFamily = i;
+      }
+
+      if ( indices.isComplete() )
+      {
+        break;
+      }
+      i++;
+    }
+    return indices;
+  }
+
   void initWindow()
   {
     glfwInit();
@@ -68,7 +116,7 @@ private:
   void initVulkan()
   {
     createInstance();
-    createSurface();
+    createSurface(); // Ensure surface is created before picking device
     pickPhysicalDevice();
     createLogicalDevice();
   }
@@ -184,6 +232,8 @@ private:
     {
       throw std::runtime_error( "failed to create window surface!" );
     }
+    // Assign to the RAII member variable
+    surface = vk::raii::SurfaceKHR( instance, vk_surface );
   }
 
   void pickPhysicalDevice()
@@ -206,49 +256,44 @@ private:
     {  // Check if a suitable device was actually found and assigned
       throw std::runtime_error( "failed to find a suitable GPU!" );
     }
+    // Store the queue family indices for the chosen device
+    queueFamilyIndices = findQueueFamilies( device );
+
     std::println( "Selected Physical Device: {}", device.getProperties().deviceName.data() );
   }
 
   bool isDeviceSuitable( const vk::raii::PhysicalDevice & physical_device )
   {
-    auto features = physical_device.getFeatures();
+    // Check if the device supports the necessary queue families
+    QueueFamilyIndices indices = findQueueFamilies( physical_device );
 
-    // Basic check: Does it support graphics queues?
-    auto queue_props        = physical_device.getQueueFamilyProperties();
-    bool foundGraphicsQueue = false;
-    for ( const auto & queue_prop : queue_props )
-    {
-      if ( queue_prop.queueFlags & vk::QueueFlagBits::eGraphics )
-      {
-        foundGraphicsQueue = true;
-        break;  // Found one, no need to check further in this loop
-      }
-    }
-    if ( !foundGraphicsQueue )
-      return false;
-    if ( !features.geometryShader )
-      return false;
+    // TODO: Add check for required device extensions (e.g., swapchain) later
 
-    // Add more checks here if needed (e.g., specific features, extensions)
-    // auto properties = check_device.getProperties();
-    // auto features = check_device.getFeatures();
-    // return properties.deviceType == vk::PhysicalDeviceType::eDiscreteGpu &&
-    // 	   features.geometryShader;
+    // TODO: Add check for specific physical device features if needed
+    // auto features = physical_device.getFeatures();
+    // if (!features.geometryShader) return false;
 
-    return true;  // If it passed all checks
+    return indices.isComplete();
   }
 
   void createLogicalDevice()
   {
-    auto                       queue_index    = findGraphicsQueueFamilyIndex( device.getQueueFamilyProperties() );
-    float                      queue_priority = 1.0f;
-    vk::DeviceQueueCreateInfo  queue_create_info{ .queueFamilyIndex = queue_index, .queueCount = 1, .pQueuePriorities = &queue_priority };
+    std::vector<vk::DeviceQueueCreateInfo> queueCreateInfos;
+    std::set<uint32_t> uniqueQueueFamilies = { queueFamilyIndices.graphicsFamily.value(), queueFamilyIndices.presentFamily.value() };
+
+    float queuePriority = 1.0f;
+    for ( uint32_t queueFamilyIndex : uniqueQueueFamilies )
+    {
+      queueCreateInfos.push_back( vk::DeviceQueueCreateInfo{ .queueFamilyIndex = queueFamilyIndex, .queueCount = 1, .pQueuePriorities = &queuePriority } );
+    }
+
     vk::PhysicalDeviceFeatures device_features{};  // Enable features here if needed
     vk::DeviceCreateInfo       device_create_info{ .pEnabledFeatures = &device_features };
-    device_create_info.setQueueCreateInfos( { queue_create_info } );
+    device_create_info.setQueueCreateInfos( queueCreateInfos );
 
     // Device extensions (add required ones like swapchain later)
     std::vector<const char *> deviceExtensions = {};  // Placeholder for now
+    // TODO: Add VK_KHR_SWAPCHAIN_EXTENSION_NAME here later
     device_create_info.setEnabledExtensionCount( static_cast<uint32_t>( deviceExtensions.size() ) );
     device_create_info.setPpEnabledExtensionNames( deviceExtensions.data() );
 
@@ -258,19 +303,21 @@ private:
     logical_device = vk::raii::Device( device, device_create_info );
     std::println( "Logical device created." );
 
-    // Get the graphics queue handle
-    graphics_queue = logical_device.getQueue( queue_index, 0 );  // Get the first queue (index 0) from the family
-    std::println( "Graphics queue obtained." );
+    // Get the queue handles
+    queues.graphicsQueue = vk::raii::Queue( logical_device, queueFamilyIndices.graphicsFamily.value(), 0 );
+    queues.presentQueue  = vk::raii::Queue( logical_device, queueFamilyIndices.presentFamily.value(), 0 );
+    std::println( "Graphics and Present queues obtained." );
   }
 
   GLFWwindow *                     window;
   vk::raii::Context                context;
   vk::raii::Instance               instance;
   vk::raii::DebugUtilsMessengerEXT debug_messenger;
+  vk::raii::SurfaceKHR             surface; // Move surface declaration earlier
   vk::raii::PhysicalDevice         device;
+  QueueFamilyIndices               queueFamilyIndices; // Add this
   vk::raii::Device                 logical_device;
-  vk::raii::Queue                  graphics_queue;  // Member to hold the graphics queue
-  vk::raii::SurfaceKHR             surface;
+  QueueHandles                     queues{ nullptr, nullptr }; // Add this, initializing queues
 };
 
 int main()

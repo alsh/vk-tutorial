@@ -1,6 +1,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <cstdlib>
+#include <fstream>
 #include <iostream>
 #include <optional>
 #include <print>
@@ -76,7 +77,7 @@ class HelloTriangleApplication
 {
 public:
   HelloTriangleApplication()
-    : instance( nullptr ), debug_messenger( nullptr ), surface( nullptr ), device( nullptr ), logical_device( nullptr ), swapChain( nullptr )
+    : instance( nullptr ), debug_messenger( nullptr ), surface( nullptr ), physical_device( nullptr ), device( nullptr ), swapChain( nullptr )
   {
   }  // Initialize graphics_queue
 
@@ -148,6 +149,9 @@ private:
     pickPhysicalDevice();
     createLogicalDevice();
     createSwapChain();
+    createImageViews();
+    createRenderPass();
+    createGraphicsPipeline();
   }
 
   void mainLoop()
@@ -278,17 +282,17 @@ private:
     {
       if ( isDeviceSuitable( device_candidate ) )
       {
-        this->device = device_candidate;  // Assign the suitable device
+        this->physical_device = device_candidate;  // Assign the suitable device
         break;
       }
     }
 
-    if ( !*device )
+    if ( !*physical_device )
     {  // Check if a suitable device was actually found and assigned
       throw std::runtime_error( "failed to find a suitable GPU!" );
     }
     // Store the queue family indices for the chosen device
-    queueFamilyIndices = findQueueFamilies( device );
+    queueFamilyIndices = findQueueFamilies( physical_device );
   }
 
   vk::SurfaceFormatKHR chooseSwapSurfaceFormat( const std::vector<vk::SurfaceFormatKHR> & availableFormats )
@@ -393,12 +397,12 @@ private:
     // Device layers are deprecated, so explicitly set count to 0.
     // device_create_info.enabledLayerCount = 0;
 
-    logical_device = vk::raii::Device( device, device_create_info );
+    device = vk::raii::Device( physical_device, device_create_info );
     std::println( "Logical device created." );
 
     // Get the queue handles
-    queues.graphicsQueue = vk::raii::Queue( logical_device, queueFamilyIndices.graphicsFamily.value(), 0 );
-    queues.presentQueue  = vk::raii::Queue( logical_device, queueFamilyIndices.presentFamily.value(), 0 );
+    queues.graphicsQueue = vk::raii::Queue( device, queueFamilyIndices.graphicsFamily.value(), 0 );
+    queues.presentQueue  = vk::raii::Queue( device, queueFamilyIndices.presentFamily.value(), 0 );
     std::println( "Graphics and Present queues obtained." );
   }
 
@@ -435,23 +439,229 @@ private:
       queueFamilyIndicesCount = 2;
       vQueueFamilyIndices     = { queueFamilyIndices.graphicsFamily.value(), queueFamilyIndices.presentFamily.value() };
     }
-    swapChain            = logical_device.createSwapchainKHR( { .surface               = *surface,
-                                                                .minImageCount         = imageCount,
-                                                                .imageFormat           = surfaceFormat.format,
-                                                                .imageColorSpace       = surfaceFormat.colorSpace,
-                                                                .imageExtent           = extent,
-                                                                .imageArrayLayers      = 1,
-                                                                .imageUsage            = vk::ImageUsageFlagBits::eColorAttachment,
-                                                                .imageSharingMode      = sharingMode,
-                                                                .queueFamilyIndexCount = queueFamilyIndicesCount,
-                                                                .pQueueFamilyIndices   = vQueueFamilyIndices.data(),
-                                                                .preTransform          = swapChainSupport.capabilities.currentTransform,
-                                                                .compositeAlpha        = vk::CompositeAlphaFlagBitsKHR::eOpaque,
-                                                                .presentMode           = presentMode,
-                                                                .clipped               = true } );
+    swapChain            = device.createSwapchainKHR( { .surface               = *surface,
+                                                        .minImageCount         = imageCount,
+                                                        .imageFormat           = surfaceFormat.format,
+                                                        .imageColorSpace       = surfaceFormat.colorSpace,
+                                                        .imageExtent           = extent,
+                                                        .imageArrayLayers      = 1,
+                                                        .imageUsage            = vk::ImageUsageFlagBits::eColorAttachment,
+                                                        .imageSharingMode      = sharingMode,
+                                                        .queueFamilyIndexCount = queueFamilyIndicesCount,
+                                                        .pQueueFamilyIndices   = vQueueFamilyIndices.data(),
+                                                        .preTransform          = swapChainSupport.capabilities.currentTransform,
+                                                        .compositeAlpha        = vk::CompositeAlphaFlagBitsKHR::eOpaque,
+                                                        .presentMode           = presentMode,
+                                                        .clipped               = true } );
     swapChainImages      = swapChain.getImages();
     swapChainImageFormat = surfaceFormat.format;
     swapChainExtent      = extent;
+  }
+
+  void createImageViews()
+  {
+    swapChainImageViews.reserve( swapChainImages.size() );
+    for ( const auto & image : swapChainImages )
+    {
+      vk::ImageViewCreateInfo createInfo{
+        .image            = image,
+        .viewType         = vk::ImageViewType::e2D,
+        .format           = swapChainImageFormat,
+        .components       = { .r = vk::ComponentSwizzle::eIdentity,
+                              .g = vk::ComponentSwizzle::eIdentity,
+                              .b = vk::ComponentSwizzle::eIdentity,
+                              .a = vk::ComponentSwizzle::eIdentity },
+        .subresourceRange = { .aspectMask = vk::ImageAspectFlagBits::eColor, .baseMipLevel = 0, .levelCount = 1, .baseArrayLayer = 0, .layerCount = 1 }
+      };
+      swapChainImageViews.push_back( device.createImageView( createInfo ) );
+    }
+  }
+
+  static std::vector<char> readFile( const std::string & filename )
+  {
+    std::ifstream file( filename, std::ios::ate | std::ios::binary );
+
+    if ( !file.is_open() )
+    {
+      throw std::runtime_error( "failed to open file!" );
+    }
+
+    size_t            fileSize = (size_t)file.tellg();
+    std::vector<char> buffer( fileSize );
+
+    file.seekg( 0 );
+    file.read( buffer.data(), fileSize );
+
+    file.close();
+
+    return buffer;
+  }
+
+  vk::ShaderModule createShaderModule( const std::vector<char> & code )
+  {
+    vk::ShaderModuleCreateInfo createInfo{ .codeSize = code.size(), .pCode = reinterpret_cast<const uint32_t *>( code.data() ) };
+    return device.createShaderModule( createInfo );
+  }
+
+  void createRenderPass()
+  {
+    vk::AttachmentDescription colorAttachment {
+      .format = swapChainImageFormat,
+      .samples = vk::SampleCountFlagBits::e1,
+      .loadOp = vk::AttachmentLoadOp::eClear,
+      .storeOp = vk::AttachmentStoreOp::eStore,
+      .stencilLoadOp = vk::AttachmentLoadOp::eDontCare,
+      .stencilStoreOp = vk::AttachmentStoreOp::eDontCare,
+      .initialLayout = vk::ImageLayout::eUndefined,
+      .finalLayout = vk::ImageLayout::ePresentSrcKHR
+    };
+
+    vk::AttachmentReference colorAttachmentRef {
+      .attachment = 0,
+      .layout = vk::ImageLayout::eColorAttachmentOptimal
+    };
+
+    vk::SubpassDescription subpass {
+      .pipelineBindPoint = vk::PipelineBindPoint::eGraphics,
+      .colorAttachmentCount = 1,
+      .pColorAttachments = &colorAttachmentRef
+    };
+    
+    vk::RenderPassCreateInfo renderPassInfo {
+      .attachmentCount = 1,
+      .pAttachments = &colorAttachment,
+      .subpassCount = 1,
+      .pSubpasses = &subpass
+    };
+    renderPass = device.createRenderPass(renderPassInfo);
+
+  }
+
+  void createGraphicsPipeline()
+  {
+    auto vertShaderCode = readFile( "./vert.spv" );
+    auto fragShaderCode = readFile( "./frag.spv" );
+
+    vk::ShaderModule vertShaderModule = createShaderModule( vertShaderCode );
+    vk::ShaderModule fragShaderModule = createShaderModule( fragShaderCode );
+
+    vk::PipelineShaderStageCreateInfo vertShaderStageInfo{
+      .stage = vk::ShaderStageFlagBits::eVertex,
+      .module = vertShaderModule,
+      .pName = "main"
+    };
+
+    vk::PipelineShaderStageCreateInfo fragShaderStageInfo{
+      .stage = vk::ShaderStageFlagBits::eFragment,
+      .module = fragShaderModule,
+      .pName = "main"
+    };
+
+    vk::PipelineShaderStageCreateInfo shaderStages[] = { vertShaderStageInfo, fragShaderStageInfo };
+    std::vector<vk::DynamicState> dynamicStates = { vk::DynamicState::eViewport, vk::DynamicState::eScissor };
+    vk::PipelineDynamicStateCreateInfo dynamicState {
+      .dynamicStateCount = static_cast<uint32_t>(dynamicStates.size()),
+      .pDynamicStates = dynamicStates.data()
+    };
+
+    vk::PipelineVertexInputStateCreateInfo vertexInputInfo {
+      .vertexBindingDescriptionCount = 0,
+      .pVertexBindingDescriptions = nullptr,
+      .vertexAttributeDescriptionCount = 0,
+      .pVertexAttributeDescriptions = nullptr
+    };
+
+    vk::PipelineInputAssemblyStateCreateInfo inputAssembly {
+      .topology = vk::PrimitiveTopology::eTriangleList,
+      .primitiveRestartEnable = vk::False
+    };
+
+    vk::Viewport viewport {
+      .x = 0.0f,
+      .y = 0.0f,
+      .width = (float)swapChainExtent.width,
+      .height = (float)swapChainExtent.height,
+      .minDepth = 0.0f,
+      .maxDepth = 1.0f
+    };
+
+    vk::Rect2D scissor {
+      .offset = { .x = 0, .y = 0 },
+      .extent = swapChainExtent
+    };
+
+    vk::PipelineViewportStateCreateInfo viewportState {
+      .viewportCount = 1,
+      .pViewports = &viewport,
+      .scissorCount = 1,
+      .pScissors = &scissor
+    };
+
+    vk::PipelineRasterizationStateCreateInfo rasterizer {
+      .depthClampEnable = vk::False,
+      .rasterizerDiscardEnable = vk::False,
+      .polygonMode = vk::PolygonMode::eFill,
+      .cullMode = vk::CullModeFlagBits::eBack,
+      .frontFace = vk::FrontFace::eClockwise,
+      .depthBiasEnable = vk::False,
+      .depthBiasConstantFactor = 0.0f,
+      .depthBiasClamp = 0.0f,
+      .depthBiasSlopeFactor = 0.0f,
+      .lineWidth = 1.0f
+    };
+
+    vk::PipelineMultisampleStateCreateInfo multisampling {
+      .rasterizationSamples = vk::SampleCountFlagBits::e1,
+      .sampleShadingEnable = vk::False,
+      .minSampleShading = 1.0f,
+      .pSampleMask = nullptr,
+      .alphaToCoverageEnable = vk::False,
+      .alphaToOneEnable = vk::False
+    };
+
+    vk::PipelineColorBlendAttachmentState colorBlendAttachment {
+      .blendEnable = vk::False,
+      .srcColorBlendFactor = vk::BlendFactor::eOne,
+      .dstColorBlendFactor = vk::BlendFactor::eZero,
+      .colorBlendOp = vk::BlendOp::eAdd,
+      .srcAlphaBlendFactor = vk::BlendFactor::eOne,
+      .dstAlphaBlendFactor = vk::BlendFactor::eZero,
+      .alphaBlendOp = vk::BlendOp::eAdd,
+      .colorWriteMask = vk::ColorComponentFlagBits::eR | vk::ColorComponentFlagBits::eG | vk::ColorComponentFlagBits::eB | vk::ColorComponentFlagBits::eA
+    };
+
+    vk::PipelineColorBlendStateCreateInfo colorBlending {
+      .logicOpEnable = vk::False,
+      .logicOp = vk::LogicOp::eCopy,
+      .attachmentCount = 1,
+      .pAttachments = &colorBlendAttachment,
+      .blendConstants = std::array{ 0.0f, 0.0f, 0.0f, 0.0f }
+    };
+
+    vk::PipelineLayoutCreateInfo pipelineLayoutInfo {
+      .setLayoutCount = 0,
+      .pSetLayouts = nullptr,
+      .pushConstantRangeCount = 0,
+      .pPushConstantRanges = nullptr
+    };
+    pipelineLayout = device.createPipelineLayout( pipelineLayoutInfo );
+
+    vk::GraphicsPipelineCreateInfo pipelineInfo {
+      .stageCount = 2,
+      .pStages = shaderStages,
+      .pVertexInputState = &vertexInputInfo,
+      .pInputAssemblyState = &inputAssembly,
+      .pViewportState = &viewportState,
+      .pRasterizationState = &rasterizer,
+      .pMultisampleState = &multisampling,
+      .pDepthStencilState = nullptr,
+      .pColorBlendState = &colorBlending,
+      .pDynamicState = &dynamicState,
+      .layout = *pipelineLayout,
+      .renderPass = *renderPass,
+      .subpass = 0
+    };
+    graphicsPipeline = device.createGraphicsPipeline( nullptr, pipelineInfo );
   }
 
   GLFWwindow *                     window;
@@ -459,15 +669,19 @@ private:
   vk::raii::Instance               instance;
   vk::raii::DebugUtilsMessengerEXT debug_messenger;
   vk::raii::SurfaceKHR             surface;  // Move surface declaration earlier
-  vk::raii::PhysicalDevice         device;
+  vk::raii::PhysicalDevice         physical_device;
   QueueFamilyIndices               queueFamilyIndices;  // Add this
   SwapChainSupportDetails          swapChainSupport;
-  vk::raii::Device                 logical_device;
+  vk::raii::Device                 device;
   QueueHandles                     queues{ nullptr, nullptr };  // Add this, initializing queues
   vk::raii::SwapchainKHR           swapChain;
-  std::vector<vk::Image>           swapChainImages;
+  std::vector<vk::raii::Image>     swapChainImages;
   vk::Format                       swapChainImageFormat;
   vk::Extent2D                     swapChainExtent;
+  std::vector<vk::raii::ImageView> swapChainImageViews;
+  vk::raii::RenderPass             renderPass;
+  vk::raii::PipelineLayout         pipelineLayout;
+  vk::raii::Pipeline               graphicsPipeline;
 };
 
 int main()

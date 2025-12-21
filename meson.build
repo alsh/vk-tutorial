@@ -24,10 +24,17 @@ endforeach
 # 			     command : [glsl_compiler,
 # 					'-V', '@INPUT@', '-o', '@OUTPUT@'])
 
-glsl_generator = generator(glsl_compiler,
-			   output    : [ '@BASENAME@.spv' ],
-			   arguments : [ '-V', '@INPUT@', '-o', '@OUTPUT@' ])
-shaders_processed = glsl_generator.process(shaders)
+
+shaders_targets = []
+foreach s : shaders
+  shaders_targets += custom_target(
+    'generate_' + s.replace('.', '_'),
+    input : s,
+    output : '@BASENAME@.spv',
+    command : [glsl_compiler, '-V', '@INPUT@', '-o', '@OUTPUT@'],
+    build_by_default : true
+  )
+endforeach
 
 
 executable('demo',

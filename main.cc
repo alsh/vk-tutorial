@@ -8,6 +8,7 @@
 #include <set>
 #include <stdexcept>
 #include <vector>
+#include <memory>
 
 #define VULKAN_HPP_NO_CONSTRUCTORS
 #include <vulkan/vulkan.hpp>
@@ -73,11 +74,30 @@ struct QueueHandles
 //   return static_cast<uint32_t>( std::distance( queueFamilyProperties.begin(), graphicsQueueFamilyProperty ) );
 // }
 
+// Free functions
+struct GlfwContext {
+    GlfwContext() {
+        if (!glfwInit()) {
+            throw std::runtime_error("failed to initialize GLFW!");
+        }
+    }
+    ~GlfwContext() {
+        glfwTerminate();
+    }
+};
+
+struct WindowDeleter {
+    void operator()(GLFWwindow* w) const {
+        glfwDestroyWindow(w);
+    }
+};
+
 class HelloTriangleApplication
 {
 public:
   HelloTriangleApplication()
-    : instance( nullptr ), debug_messenger( nullptr ), surface( nullptr ), physical_device( nullptr ), device( nullptr ), swapChain( nullptr )
+    : instance( nullptr ), debug_messenger( nullptr ), surface( nullptr ), physical_device( nullptr ), device( nullptr ), swapChain( nullptr ),
+      renderPass( nullptr ), pipelineLayout( nullptr ), graphicsPipeline( nullptr ), commandPool( nullptr ), commandBuffers{}, imageSyncObjects{}, renderFinishedSemaphores{}
   {
   }  // Initialize graphics_queue
 
@@ -124,17 +144,13 @@ private:
     // NOTE: On Wayland, the window will remain invisible until the first frame is presented.
     // This is normal behavior. The window is created but has no content, so the compositor
     // does not display it. It will appear once the swap chain is created and the first image is presented.
-    // glfwInitHint( GLFW_PLATFORM, GLFW_PLATFORM_X11 ); // Uncomment to force X11 if needed for debugging
-
-    if ( !glfwInit() )
-    {
-      throw std::runtime_error( "failed to initialize GLFW!" );
-    }
+    
+    // glfwInit is handled by GlfwContext member
 
     glfwWindowHint( GLFW_CLIENT_API, GLFW_NO_API );
     glfwWindowHint( GLFW_RESIZABLE, GLFW_FALSE );
 
-    window = glfwCreateWindow( WIDTH, HEIGHT, "Vulkan", nullptr, nullptr );
+    window.reset(glfwCreateWindow( WIDTH, HEIGHT, "Vulkan", nullptr, nullptr ));
     if ( !window )
     {
       throw std::runtime_error( "failed to create window!" );
@@ -152,22 +168,30 @@ private:
     createImageViews();
     createRenderPass();
     createGraphicsPipeline();
+    createFramebuffers();
+    createCommandPool();
+    createCommandBuffers();
+    createSyncObjects();
   }
 
   void mainLoop()
   {
-    while ( !glfwWindowShouldClose( window ) )
+    while ( !glfwWindowShouldClose( window.get() ) )
     {
       glfwPollEvents();
+      drawFrame();
     }
+
+    device.waitIdle();
   }
 
   void cleanup()
   {
-    // Destroy logical device before instance
-    // RAII handles this automatically for logical_device, graphics_queue, debug_messenger, instance
-    glfwDestroyWindow( window );
-    glfwTerminate();
+      // Resources handled by RAII
+      // Destruction order:
+      // 1. Vulkan Resources (Swapchain, Pipeline, etc.) - via members
+      // 2. Window - via unique_ptr
+      // 3. GlfwContext - via member destructor (calls glfwTerminate)
   }
 
   std::vector<const char *> getRequiredExtensions()
@@ -261,11 +285,10 @@ private:
   void createSurface()
   {
     VkSurfaceKHR vk_surface;
-    if ( glfwCreateWindowSurface( *instance, window, nullptr, &vk_surface ) != VK_SUCCESS )
+    if ( glfwCreateWindowSurface( *instance, window.get(), nullptr, &vk_surface ) != VK_SUCCESS )
     {
       throw std::runtime_error( "failed to create window surface!" );
     }
-    // Assign to the RAII member variable
     surface = vk::raii::SurfaceKHR( instance, vk_surface );
   }
 
@@ -330,7 +353,7 @@ private:
     else
     {
       int width, height;
-      glfwGetFramebufferSize( window, &width, &height );
+      glfwGetFramebufferSize( window.get(), &width, &height );
 
       vk::Extent2D actualExtent = { static_cast<uint32_t>( width ), static_cast<uint32_t>( height ) };
 
@@ -401,8 +424,8 @@ private:
     std::println( "Logical device created." );
 
     // Get the queue handles
-    queues.graphicsQueue = vk::raii::Queue( device, queueFamilyIndices.graphicsFamily.value(), 0 );
-    queues.presentQueue  = vk::raii::Queue( device, queueFamilyIndices.presentFamily.value(), 0 );
+    queues.graphicsQueue = device.getQueue( queueFamilyIndices.graphicsFamily.value(), 0 );
+    queues.presentQueue  = device.getQueue( queueFamilyIndices.presentFamily.value(), 0 );
     std::println( "Graphics and Present queues obtained." );
   }
 
@@ -497,7 +520,7 @@ private:
     return buffer;
   }
 
-  vk::ShaderModule createShaderModule( const std::vector<char> & code )
+  auto createShaderModule( const std::vector<char> & code )
   {
     vk::ShaderModuleCreateInfo createInfo{ .codeSize = code.size(), .pCode = reinterpret_cast<const uint32_t *>( code.data() ) };
     return device.createShaderModule( createInfo );
@@ -527,11 +550,22 @@ private:
       .pColorAttachments = &colorAttachmentRef
     };
     
+    vk::SubpassDependency dependency {
+      .srcSubpass = VK_SUBPASS_EXTERNAL,
+      .dstSubpass = 0,
+      .srcStageMask = vk::PipelineStageFlagBits::eColorAttachmentOutput,
+      .dstStageMask = vk::PipelineStageFlagBits::eColorAttachmentOutput,
+      .srcAccessMask = {},
+      .dstAccessMask = vk::AccessFlagBits::eColorAttachmentWrite,
+    };
+
     vk::RenderPassCreateInfo renderPassInfo {
       .attachmentCount = 1,
       .pAttachments = &colorAttachment,
       .subpassCount = 1,
-      .pSubpasses = &subpass
+      .pSubpasses = &subpass,
+      .dependencyCount = 1,
+      .pDependencies = &dependency
     };
     renderPass = device.createRenderPass(renderPassInfo);
 
@@ -539,11 +573,11 @@ private:
 
   void createGraphicsPipeline()
   {
-    auto vertShaderCode = readFile( "./vert.spv" );
-    auto fragShaderCode = readFile( "./frag.spv" );
+    auto vertShaderCode = readFile( "./triangle.spv" );
+    auto fragShaderCode = readFile( "./red_triangle.spv" );
 
-    vk::ShaderModule vertShaderModule = createShaderModule( vertShaderCode );
-    vk::ShaderModule fragShaderModule = createShaderModule( fragShaderCode );
+    auto vertShaderModule = createShaderModule( vertShaderCode );
+    auto fragShaderModule = createShaderModule( fragShaderCode );
 
     vk::PipelineShaderStageCreateInfo vertShaderStageInfo{
       .stage = vk::ShaderStageFlagBits::eVertex,
@@ -664,24 +698,183 @@ private:
     graphicsPipeline = device.createGraphicsPipeline( nullptr, pipelineInfo );
   }
 
-  GLFWwindow *                     window;
+  void createFramebuffers() {
+    for (auto & imageView : swapChainImageViews) {
+      vk::ImageView attachments[] = { *imageView };
+
+      vk::FramebufferCreateInfo framebufferInfo {
+        .renderPass = *renderPass,
+        .attachmentCount = 1,
+        .pAttachments = attachments,
+        .width = swapChainExtent.width,
+        .height = swapChainExtent.height,
+        .layers = 1
+      };
+
+      swapChainFramebuffers.emplace_back(device.createFramebuffer(framebufferInfo));
+    }
+  }
+
+  void createCommandPool() {
+    vk::CommandPoolCreateInfo poolInfo {
+      .flags = vk::CommandPoolCreateFlagBits::eResetCommandBuffer,
+      .queueFamilyIndex = queueFamilyIndices.graphicsFamily.value()
+    };
+    commandPool = device.createCommandPool(poolInfo);
+  }
+
+  void createCommandBuffers() {
+    vk::CommandBufferAllocateInfo allocInfo {
+      .commandPool = *commandPool,
+      .level = vk::CommandBufferLevel::ePrimary,
+      .commandBufferCount = MAX_FRAMES_IN_FLIGHT
+    };
+    commandBuffers = device.allocateCommandBuffers(allocInfo);
+  }
+
+  void recordCommandBuffer(vk::CommandBuffer commandBuffer, uint32_t imageIndex) {
+    vk::CommandBufferBeginInfo beginInfo;
+    commandBuffer.begin(beginInfo);
+
+    vk::ClearValue clearColor = { .color = vk::ClearColorValue{ std::array{ 0.0f, 0.0f, 0.0f, 1.0f } } };
+    vk::RenderPassBeginInfo renderPassInfo {
+      .renderPass = *renderPass,
+      .framebuffer = *swapChainFramebuffers[imageIndex],
+      .renderArea = {
+        .offset = { .x = 0, .y = 0 },
+        .extent = swapChainExtent
+      },
+      .clearValueCount = 1,
+      .pClearValues = &clearColor
+    };
+
+    commandBuffer.beginRenderPass(renderPassInfo, vk::SubpassContents::eInline);
+
+    commandBuffer.bindPipeline(vk::PipelineBindPoint::eGraphics, *graphicsPipeline);
+
+    vk::Viewport viewport {
+      .x = 0.0f,
+      .y = 0.0f,
+      .width = (float)swapChainExtent.width,
+      .height = (float)swapChainExtent.height,
+      .minDepth = 0.0f,
+      .maxDepth = 1.0f
+    };
+    commandBuffer.setViewport(0, viewport);
+
+    vk::Rect2D scissor {
+      .offset = { .x = 0, .y = 0 },
+      .extent = swapChainExtent
+    };
+    commandBuffer.setScissor(0, scissor);
+
+    commandBuffer.draw(3, 1, 0, 0);
+
+    commandBuffer.endRenderPass();
+    commandBuffer.end();
+  }
+
+  void createSyncObjects() {
+    vk::SemaphoreCreateInfo semaphoreInfo {};
+
+    for (size_t i = 0; i < MAX_FRAMES_IN_FLIGHT; i++) {
+      imageSyncObjects.push_back({
+         device.createSemaphore(semaphoreInfo),
+         device.createFence(vk::FenceCreateInfo { .flags = vk::FenceCreateFlagBits::eSignaled })
+      });
+    }
+
+    renderFinishedSemaphores.reserve(swapChainImages.size());
+    for (size_t i = 0; i < swapChainImages.size(); i++) {
+      renderFinishedSemaphores.push_back(device.createSemaphore(semaphoreInfo));
+    }
+  }
+
+  void drawFrame() {
+    vk::Semaphore imageAvailableSemaphore = *imageSyncObjects[currentFrame].imageAvailableSemaphore;
+    vk::Fence inFlightFence = *imageSyncObjects[currentFrame].inFlightFence;
+    vk::CommandBuffer commandBuffer = *commandBuffers[currentFrame];
+
+    auto waitResult = device.waitForFences(
+      std::array{ inFlightFence },
+      vk::True,
+      std::numeric_limits<uint64_t>::max()
+    );
+    if (waitResult != vk::Result::eSuccess) {
+      throw std::runtime_error("failed to wait for fence!");
+    }
+    device.resetFences(std::array{ inFlightFence });
+
+    vk::AcquireNextImageInfoKHR acquireInfo {
+      .swapchain = *swapChain,
+      .timeout = std::numeric_limits<uint64_t>::max(),
+      .semaphore = imageAvailableSemaphore,
+      .deviceMask = 1,
+    };
+    uint32_t imageIndex = device.acquireNextImage2KHR(acquireInfo).value;
+    vk::Semaphore renderFinishedSemaphore = *renderFinishedSemaphores[imageIndex];
+    commandBuffer.reset();
+    recordCommandBuffer(commandBuffer, imageIndex);
+
+    vk::PipelineStageFlags waitStage = vk::PipelineStageFlagBits::eColorAttachmentOutput;
+    vk::SubmitInfo submitInfo {
+      .waitSemaphoreCount = 1,
+      .pWaitSemaphores = &imageAvailableSemaphore,
+      .pWaitDstStageMask = &waitStage,
+      .commandBufferCount = 1,
+      .pCommandBuffers = &commandBuffer,
+      .signalSemaphoreCount = 1,
+      .pSignalSemaphores = &renderFinishedSemaphore,
+    };
+
+    queues.graphicsQueue.submit(submitInfo, inFlightFence);
+
+    vk::PresentInfoKHR presentInfo {
+      .waitSemaphoreCount = 1,
+      .pWaitSemaphores = &renderFinishedSemaphore,
+      .swapchainCount = 1,
+      .pSwapchains = &*swapChain,
+      .pImageIndices = &imageIndex,
+    };
+    auto presentResult = queues.presentQueue.presentKHR(presentInfo);
+    if (presentResult != vk::Result::eSuccess && presentResult != vk::Result::eSuboptimalKHR) {
+      throw std::runtime_error("failed to present swap chain image!");
+    }
+
+    currentFrame = (currentFrame + 1) % MAX_FRAMES_IN_FLIGHT;
+  }
+
+  static constexpr int MAX_FRAMES_IN_FLIGHT = 2;
+  GlfwContext                      glfwContext;
+  std::unique_ptr<GLFWwindow, WindowDeleter> window;
   vk::raii::Context                context;
   vk::raii::Instance               instance;
   vk::raii::DebugUtilsMessengerEXT debug_messenger;
-  vk::raii::SurfaceKHR             surface;  // Move surface declaration earlier
+  vk::raii::SurfaceKHR             surface;
   vk::raii::PhysicalDevice         physical_device;
-  QueueFamilyIndices               queueFamilyIndices;  // Add this
+  QueueFamilyIndices               queueFamilyIndices;
   SwapChainSupportDetails          swapChainSupport;
   vk::raii::Device                 device;
-  QueueHandles                     queues{ nullptr, nullptr };  // Add this, initializing queues
+  QueueHandles                     queues{ nullptr, nullptr };
   vk::raii::SwapchainKHR           swapChain;
-  std::vector<vk::raii::Image>     swapChainImages;
+  std::vector<vk::Image>           swapChainImages;
   vk::Format                       swapChainImageFormat;
   vk::Extent2D                     swapChainExtent;
   std::vector<vk::raii::ImageView> swapChainImageViews;
   vk::raii::RenderPass             renderPass;
   vk::raii::PipelineLayout         pipelineLayout;
   vk::raii::Pipeline               graphicsPipeline;
+  std::vector<vk::raii::Framebuffer> swapChainFramebuffers;
+  vk::raii::CommandPool            commandPool;
+  std::vector<vk::raii::CommandBuffer> commandBuffers;
+
+  struct ImageSyncObjects {
+    vk::raii::Semaphore imageAvailableSemaphore;
+    vk::raii::Fence inFlightFence;
+  };
+  std::vector<ImageSyncObjects> imageSyncObjects;
+  std::vector<vk::raii::Semaphore> renderFinishedSemaphores;
+  uint32_t currentFrame = 0;
 };
 
 int main()

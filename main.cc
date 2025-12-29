@@ -22,6 +22,8 @@
 #include <GLFW/glfw3.h>
 // #include "utils.hpp"
 
+#include <glm/glm.hpp>
+
 const uint32_t WIDTH  = 800;
 const uint32_t HEIGHT = 600;
 
@@ -96,8 +98,8 @@ class HelloTriangleApplication
 {
 public:
   HelloTriangleApplication()
-    : instance( nullptr ), debug_messenger( nullptr ), surface( nullptr ), physical_device( nullptr ), device( nullptr ), swapChain( nullptr ),
-      renderPass( nullptr ), pipelineLayout( nullptr ), graphicsPipeline( nullptr ), commandPool( nullptr ), commandBuffers{}, imageSyncObjects{}, renderFinishedSemaphores{}
+    : instance( nullptr ), debug_messenger( nullptr ), surface( nullptr ), physicalDevice( nullptr ), device( nullptr ), swapChain( nullptr ),
+      renderPass( nullptr ), pipelineLayout( nullptr ), graphicsPipeline( nullptr ), commandPool( nullptr ), vertexBufferMemory( nullptr ), vertexBuffer( nullptr ), commandBuffers{}, imageSyncObjects{}, renderFinishedSemaphores{}
   {
   }  // Initialize graphics_queue
 
@@ -139,6 +141,11 @@ private:
     return indices;
   }
 
+  static void framebufferResizeCallback(GLFWwindow* window, int width, int height) {
+    auto app = reinterpret_cast<HelloTriangleApplication*>(glfwGetWindowUserPointer(window));
+    app->framebufferResized = true;
+  }
+
   void initWindow()
   {
     // NOTE: On Wayland, the window will remain invisible until the first frame is presented.
@@ -148,13 +155,14 @@ private:
     // glfwInit is handled by GlfwContext member
 
     glfwWindowHint( GLFW_CLIENT_API, GLFW_NO_API );
-    glfwWindowHint( GLFW_RESIZABLE, GLFW_FALSE );
 
     window.reset(glfwCreateWindow( WIDTH, HEIGHT, "Vulkan", nullptr, nullptr ));
     if ( !window )
     {
       throw std::runtime_error( "failed to create window!" );
     }
+    glfwSetWindowUserPointer(window.get(), this);
+    glfwSetFramebufferSizeCallback(window.get(), framebufferResizeCallback);
     std::println( "Window created. Note: On Wayland, the window may remain invisible until the first frame is presented." );
   }
 
@@ -170,6 +178,7 @@ private:
     createGraphicsPipeline();
     createFramebuffers();
     createCommandPool();
+    createVertexBuffer();
     createCommandBuffers();
     createSyncObjects();
   }
@@ -305,17 +314,17 @@ private:
     {
       if ( isDeviceSuitable( device_candidate ) )
       {
-        this->physical_device = device_candidate;  // Assign the suitable device
+        this->physicalDevice = device_candidate;  // Assign the suitable device
         break;
       }
     }
 
-    if ( !*physical_device )
+    if ( !*physicalDevice )
     {  // Check if a suitable device was actually found and assigned
       throw std::runtime_error( "failed to find a suitable GPU!" );
     }
     // Store the queue family indices for the chosen device
-    queueFamilyIndices = findQueueFamilies( physical_device );
+    queueFamilyIndices = findQueueFamilies( physicalDevice );
   }
 
   vk::SurfaceFormatKHR chooseSwapSurfaceFormat( const std::vector<vk::SurfaceFormatKHR> & availableFormats )
@@ -420,7 +429,7 @@ private:
     // Device layers are deprecated, so explicitly set count to 0.
     // device_create_info.enabledLayerCount = 0;
 
-    device = vk::raii::Device( physical_device, device_create_info );
+    device = vk::raii::Device( physicalDevice, device_create_info );
     std::println( "Logical device created." );
 
     // Get the queue handles
@@ -598,11 +607,14 @@ private:
       .pDynamicStates = dynamicStates.data()
     };
 
+    auto bindingDescription = Vertex::getBindingDescription();
+    auto attributeDescriptions = Vertex::getAttributeDescriptions();
+
     vk::PipelineVertexInputStateCreateInfo vertexInputInfo {
-      .vertexBindingDescriptionCount = 0,
-      .pVertexBindingDescriptions = nullptr,
-      .vertexAttributeDescriptionCount = 0,
-      .pVertexAttributeDescriptions = nullptr
+      .vertexBindingDescriptionCount = 1,
+      .pVertexBindingDescriptions = &bindingDescription,
+      .vertexAttributeDescriptionCount = attributeDescriptions.size(),
+      .pVertexAttributeDescriptions = attributeDescriptions.data()
     };
 
     vk::PipelineInputAssemblyStateCreateInfo inputAssembly {
@@ -723,6 +735,43 @@ private:
     commandPool = device.createCommandPool(poolInfo);
   }
 
+  uint32_t findMemoryType(uint32_t typeFilter, vk::MemoryPropertyFlags properties) {
+    vk::PhysicalDeviceMemoryProperties memProperties = physicalDevice.getMemoryProperties();
+    
+    for (uint32_t i = 0; i < memProperties.memoryTypes.size(); i++) {
+      if (typeFilter & (1 << i) && (memProperties.memoryTypes[i].propertyFlags & properties) == properties) {
+        return i;
+      }
+    }
+    
+    throw std::runtime_error("failed to find suitable memory type!");
+  }
+
+  void createVertexBuffer() {
+    vk::BufferCreateInfo bufferInfo {
+      .size = sizeof(vertices[0]) * vertices.size(),
+      .usage = vk::BufferUsageFlagBits::eVertexBuffer,
+      .sharingMode = vk::SharingMode::eExclusive
+    };
+    
+    vertexBuffer = device.createBuffer(bufferInfo);
+
+    vk::MemoryRequirements memRequirements = vertexBuffer.getMemoryRequirements();
+
+    vk::MemoryAllocateInfo allocInfo {
+      .allocationSize = memRequirements.size,
+      .memoryTypeIndex = findMemoryType(memRequirements.memoryTypeBits, vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent)
+    };
+
+    vertexBufferMemory = device.allocateMemory(allocInfo);
+    vertexBuffer.bindMemory(*vertexBufferMemory, 0);
+
+
+    void *data = vertexBufferMemory.mapMemory( 0, bufferInfo.size );
+    memcpy(data, vertices.data(), (size_t)bufferInfo.size);
+    vertexBufferMemory.unmapMemory();
+  }
+
   void createCommandBuffers() {
     vk::CommandBufferAllocateInfo allocInfo {
       .commandPool = *commandPool,
@@ -752,6 +801,10 @@ private:
 
     commandBuffer.bindPipeline(vk::PipelineBindPoint::eGraphics, *graphicsPipeline);
 
+    std::vector<vk::Buffer> vertexBuffers = { *vertexBuffer };
+    vk::DeviceSize offsets[] = { 0 };
+    commandBuffer.bindVertexBuffers(0, vertexBuffers, offsets);
+   
     vk::Viewport viewport {
       .x = 0.0f,
       .y = 0.0f,
@@ -768,7 +821,7 @@ private:
     };
     commandBuffer.setScissor(0, scissor);
 
-    commandBuffer.draw(3, 1, 0, 0);
+    commandBuffer.draw(vertices.size(), 1, 0, 0);
 
     commandBuffer.endRenderPass();
     commandBuffer.end();
@@ -811,7 +864,16 @@ private:
       .semaphore = imageAvailableSemaphore,
       .deviceMask = 1,
     };
-    uint32_t imageIndex = device.acquireNextImage2KHR(acquireInfo).value;
+
+    auto acquireResult = device.acquireNextImage2KHR(acquireInfo);
+    if (acquireResult.result == vk::Result::eErrorOutOfDateKHR) {
+      recreateSwapChain();
+      return;
+    }
+    else if (acquireResult.result != vk::Result::eSuccess && acquireResult.result != vk::Result::eSuboptimalKHR) {
+      throw std::runtime_error("failed to acquire swap chain image!");
+    }
+    uint32_t imageIndex = acquireResult.value;
     vk::Semaphore renderFinishedSemaphore = *renderFinishedSemaphores[imageIndex];
     commandBuffer.reset();
     recordCommandBuffer(commandBuffer, imageIndex);
@@ -837,11 +899,32 @@ private:
       .pImageIndices = &imageIndex,
     };
     auto presentResult = queues.presentQueue.presentKHR(presentInfo);
-    if (presentResult != vk::Result::eSuccess && presentResult != vk::Result::eSuboptimalKHR) {
+    if (presentResult == vk::Result::eErrorOutOfDateKHR || presentResult == vk::Result::eSuboptimalKHR || framebufferResized) {
+      recreateSwapChain();
+    } else if (presentResult != vk::Result::eSuccess) {
       throw std::runtime_error("failed to present swap chain image!");
     }
 
     currentFrame = (currentFrame + 1) % MAX_FRAMES_IN_FLIGHT;
+  }
+
+  void recreateSwapChain() {
+
+    int width = 0, height = 0;
+    glfwGetFramebufferSize(window.get(), &width, &height);
+    while (width == 0 || height == 0) {
+      glfwGetFramebufferSize(window.get(), &width, &height);
+      glfwWaitEvents();
+    }
+    device.waitIdle();
+
+    swapChainFramebuffers.clear();
+    swapChainImageViews.clear();
+    swapChain.clear();
+
+    createSwapChain();
+    createImageViews();
+    createFramebuffers();
   }
 
   static constexpr int MAX_FRAMES_IN_FLIGHT = 2;
@@ -851,7 +934,7 @@ private:
   vk::raii::Instance               instance;
   vk::raii::DebugUtilsMessengerEXT debug_messenger;
   vk::raii::SurfaceKHR             surface;
-  vk::raii::PhysicalDevice         physical_device;
+  vk::raii::PhysicalDevice         physicalDevice;
   QueueFamilyIndices               queueFamilyIndices;
   SwapChainSupportDetails          swapChainSupport;
   vk::raii::Device                 device;
@@ -866,6 +949,8 @@ private:
   vk::raii::Pipeline               graphicsPipeline;
   std::vector<vk::raii::Framebuffer> swapChainFramebuffers;
   vk::raii::CommandPool            commandPool;
+  vk::raii::DeviceMemory           vertexBufferMemory;
+  vk::raii::Buffer                 vertexBuffer;
   std::vector<vk::raii::CommandBuffer> commandBuffers;
 
   struct ImageSyncObjects {
@@ -874,7 +959,50 @@ private:
   };
   std::vector<ImageSyncObjects> imageSyncObjects;
   std::vector<vk::raii::Semaphore> renderFinishedSemaphores;
+  bool framebufferResized = false;
   uint32_t currentFrame = 0;
+
+  struct Vertex {
+    glm::vec2 pos;
+    glm::vec3 color;
+
+    static vk::VertexInputBindingDescription getBindingDescription() {
+        vk::VertexInputBindingDescription bindingDescription{
+          .binding = 0,
+          .stride = sizeof(Vertex),
+          .inputRate = vk::VertexInputRate::eVertex
+        };
+
+        return bindingDescription;
+    }
+
+    static std::array<vk::VertexInputAttributeDescription, 2> getAttributeDescriptions() {
+      vk::VertexInputAttributeDescription attr1 {
+        .location = 0,
+        .binding = 0,
+        .format = vk::Format::eR32G32Sfloat,
+        .offset = offsetof(Vertex, pos)
+      };
+      vk::VertexInputAttributeDescription attr2 {
+        .location = 1,
+        .binding = 0,
+        .format = vk::Format::eR32G32B32Sfloat,
+        .offset = offsetof(Vertex, color)
+      };
+      std::array<vk::VertexInputAttributeDescription, 2> attributeDescriptions {
+        attr1,
+        attr2
+      };
+
+      return attributeDescriptions;
+    }
+  };
+
+  const std::vector<Vertex> vertices = {
+    {{0.0f, -0.5f}, {1.0f, 0.0f, 0.0f}},
+    {{0.5f, 0.5f}, {0.0f, 1.0f, 0.0f}},
+    {{-0.5f, 0.5f}, {0.0f, 0.0f, 1.0f}}
+  };
 };
 
 int main()

@@ -1,3 +1,6 @@
+#include "device_buffer.hpp"
+#include "vulkan_config.hpp"
+
 #include <algorithm>
 #include <array>
 #include <bit>
@@ -7,7 +10,6 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
-#include <cstring>
 #include <exception>
 #include <fstream>
 #include <iostream>
@@ -16,6 +18,7 @@
 #include <memory>
 #include <optional>
 #include <set>
+#include <span>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -24,16 +27,11 @@
 #include <type_traits>
 #include <utility>
 #include <vector>
-
-#define VULKAN_HPP_NO_CONSTRUCTORS
 #include <vulkan/vulkan.hpp>
 #include <vulkan/vulkan_raii.hpp>
 
 #define GLFW_INCLUDE_VULKAN
 #include <GLFW/glfw3.h>
-
-#define GLM_FORCE_RADIANS
-#define GLM_FORCE_DEPTH_ZERO_TO_ONE
 #include <glm/glm.hpp>
 #include <glm/gtc/matrix_transform.hpp>
 
@@ -75,49 +73,6 @@ namespace
     vk::SurfaceCapabilitiesKHR        capabilities;
     std::vector<vk::SurfaceFormatKHR> formats;
     std::vector<vk::PresentModeKHR>   presentModes;
-  };
-
-  struct MemoryTypeSelection
-  {
-    std::uint32_t           index = 0;
-    vk::MemoryPropertyFlags properties;
-  };
-
-  struct DeviceBuffer
-  {
-    vk::DeviceSize          sizeBytes = 0;
-    vk::raii::DeviceMemory  memory{ nullptr };
-    vk::raii::Buffer        buffer{ nullptr };
-    vk::MemoryPropertyFlags memoryProperties;
-
-    void upload( vk::raii::Device const & device, void const * data, vk::DeviceSize copySize ) const
-    {
-      if ( copySize > sizeBytes )
-      {
-        throw std::runtime_error( "buffer upload exceeds the destination buffer size" );
-      }
-      if ( copySize > std::numeric_limits<std::size_t>::max() )
-      {
-        throw std::runtime_error( "buffer upload size exceeds the host address range" );
-      }
-
-      void * mappedData = memory.mapMemory( 0, vk::WholeSize );
-      try
-      {
-        std::memcpy( mappedData, data, static_cast<std::size_t>( copySize ) );
-        if ( !( memoryProperties & vk::MemoryPropertyFlagBits::eHostCoherent ) )
-        {
-          vk::MappedMemoryRange range{ .memory = *memory, .offset = 0, .size = vk::WholeSize };
-          device.flushMappedMemoryRanges( range );
-        }
-      }
-      catch ( ... )
-      {
-        memory.unmapMemory();
-        throw;
-      }
-      memory.unmapMemory();
-    }
   };
 
   struct DeviceImage
@@ -768,73 +723,6 @@ namespace
       }
     }
 
-    [[nodiscard]] MemoryTypeSelection
-      findMemoryType( std::uint32_t typeFilter, vk::MemoryPropertyFlags requiredProperties, vk::MemoryPropertyFlags preferredProperties ) const
-    {
-      vk::PhysicalDeviceMemoryProperties const memoryProperties = physicalDevice.getMemoryProperties();
-      std::optional<MemoryTypeSelection>       fallback;
-      for ( std::uint32_t i = 0; i < memoryProperties.memoryTypeCount; ++i )
-      {
-        if ( ( typeFilter & ( std::uint32_t{ 1 } << i ) ) == 0 )
-        {
-          continue;
-        }
-
-        vk::MemoryPropertyFlags const properties = memoryProperties.memoryTypes[i].propertyFlags;
-        if ( ( properties & requiredProperties ) != requiredProperties )
-        {
-          continue;
-        }
-
-        MemoryTypeSelection const selection{ .index = i, .properties = properties };
-        if ( ( properties & preferredProperties ) == preferredProperties )
-        {
-          return selection;
-        }
-        if ( !fallback )
-        {
-          fallback = selection;
-        }
-      }
-
-      if ( fallback )
-      {
-        return *fallback;
-      }
-      throw std::runtime_error( "no compatible Vulkan memory type is available" );
-    }
-
-    [[nodiscard]] DeviceBuffer createBuffer( vk::DeviceSize          sizeBytes,
-                                             vk::BufferUsageFlags    usage,
-                                             vk::MemoryPropertyFlags requiredProperties,
-                                             vk::MemoryPropertyFlags preferredProperties = {} ) const
-    {
-      if ( sizeBytes == 0 )
-      {
-        throw std::runtime_error( "cannot create a zero-size Vulkan buffer" );
-      }
-
-      vk::raii::Buffer             buffer       = device.createBuffer( vk::BufferCreateInfo{
-        .size        = sizeBytes,
-        .usage       = usage,
-        .sharingMode = vk::SharingMode::eExclusive,
-      } );
-      vk::MemoryRequirements const requirements = buffer.getMemoryRequirements();
-      MemoryTypeSelection const    memoryType   = findMemoryType( requirements.memoryTypeBits, requiredProperties, preferredProperties );
-      vk::raii::DeviceMemory       memory       = device.allocateMemory( vk::MemoryAllocateInfo{
-        .allocationSize  = requirements.size,
-        .memoryTypeIndex = memoryType.index,
-      } );
-      buffer.bindMemory( *memory, 0 );
-
-      return {
-        .sizeBytes        = sizeBytes,
-        .memory           = std::move( memory ),
-        .buffer           = std::move( buffer ),
-        .memoryProperties = memoryType.properties,
-      };
-    }
-
     [[nodiscard]] DeviceImage createImage( std::uint32_t           width,
                                            std::uint32_t           height,
                                            std::uint32_t           mipLevels,
@@ -861,10 +749,15 @@ namespace
         .initialLayout = vk::ImageLayout::eUndefined,
       } );
       vk::MemoryRequirements const requirements = image.getMemoryRequirements();
-      MemoryTypeSelection const    memoryType   = findMemoryType( requirements.memoryTypeBits, requiredProperties, vk::MemoryPropertyFlagBits::eDeviceLocal );
-      vk::raii::DeviceMemory       memory       = device.allocateMemory( vk::MemoryAllocateInfo{
+      auto const                   memoryType   = rendering::selectMemoryType(
+        physicalDevice.getMemoryProperties(), requirements.memoryTypeBits, requiredProperties, vk::MemoryPropertyFlagBits::eDeviceLocal );
+      if ( !memoryType )
+      {
+        throw std::runtime_error( "no compatible Vulkan memory type is available for the image" );
+      }
+      vk::raii::DeviceMemory memory = device.allocateMemory( vk::MemoryAllocateInfo{
         .allocationSize  = requirements.size,
-        .memoryTypeIndex = memoryType.index,
+        .memoryTypeIndex = memoryType->index,
       } );
       image.bindMemory( *memory, 0 );
 
@@ -906,19 +799,11 @@ namespace
       }
     }
 
-    void copyBuffer( DeviceBuffer const & source, DeviceBuffer const & destination )
+    void copyBufferAndWait( rendering::DeviceBuffer const & source, rendering::DeviceBuffer const & destination )
     {
-      if ( source.sizeBytes > destination.sizeBytes )
-      {
-        throw std::runtime_error( "source buffer is larger than the destination buffer" );
-      }
-
       withOneTimeCommandBuffer(
         [&]( vk::CommandBuffer commandBuffer )
-        {
-          vk::BufferCopy const copyRegion{ .srcOffset = 0, .dstOffset = 0, .size = source.sizeBytes };
-          commandBuffer.copyBuffer( *source.buffer, *destination.buffer, copyRegion );
-        } );
+        { source.recordCopyTo( commandBuffer, destination, rendering::BufferByteRange{ .offsetBytes = 0, .sizeBytes = source.sizeBytes() } ); } );
     }
 
     void createCommandPool()
@@ -1092,14 +977,22 @@ namespace
       {
         throw std::runtime_error( "model vertex data is empty or too large" );
       }
-      vk::DeviceSize const bufferSize = static_cast<vk::DeviceSize>( vertices.size() ) * sizeof( Vertex );
-      DeviceBuffer         stagingBuffer =
-        createBuffer( bufferSize, vk::BufferUsageFlagBits::eTransferSrc, vk::MemoryPropertyFlagBits::eHostVisible, vk::MemoryPropertyFlagBits::eHostCoherent );
-      stagingBuffer.upload( device, vertices.data(), bufferSize );
+      vk::DeviceSize const    bufferSize    = static_cast<vk::DeviceSize>( vertices.size() ) * sizeof( Vertex );
+      rendering::DeviceBuffer stagingBuffer = rendering::DeviceBuffer::create( physicalDevice,
+                                                                               device,
+                                                                               bufferSize,
+                                                                               vk::BufferUsageFlagBits::eTransferSrc,
+                                                                               vk::MemoryPropertyFlagBits::eHostVisible,
+                                                                               vk::MemoryPropertyFlagBits::eHostCoherent );
+      std::span<Vertex const> vertexData{ vertices };
+      stagingBuffer.writeBytes( std::as_bytes( vertexData ) );
 
-      vertexBuffer =
-        createBuffer( bufferSize, vk::BufferUsageFlagBits::eTransferDst | vk::BufferUsageFlagBits::eVertexBuffer, vk::MemoryPropertyFlagBits::eDeviceLocal );
-      copyBuffer( stagingBuffer, vertexBuffer );
+      vertexBuffer.emplace( rendering::DeviceBuffer::create( physicalDevice,
+                                                             device,
+                                                             bufferSize,
+                                                             vk::BufferUsageFlagBits::eTransferDst | vk::BufferUsageFlagBits::eVertexBuffer,
+                                                             vk::MemoryPropertyFlagBits::eDeviceLocal ) );
+      copyBufferAndWait( stagingBuffer, *vertexBuffer );
     }
 
     void createIndexBuffer()
@@ -1108,14 +1001,22 @@ namespace
       {
         throw std::runtime_error( "model index data is empty or too large" );
       }
-      vk::DeviceSize const bufferSize = static_cast<vk::DeviceSize>( indices.size() ) * sizeof( std::uint32_t );
-      DeviceBuffer         stagingBuffer =
-        createBuffer( bufferSize, vk::BufferUsageFlagBits::eTransferSrc, vk::MemoryPropertyFlagBits::eHostVisible, vk::MemoryPropertyFlagBits::eHostCoherent );
-      stagingBuffer.upload( device, indices.data(), bufferSize );
+      vk::DeviceSize const           bufferSize    = static_cast<vk::DeviceSize>( indices.size() ) * sizeof( std::uint32_t );
+      rendering::DeviceBuffer        stagingBuffer = rendering::DeviceBuffer::create( physicalDevice,
+                                                                                      device,
+                                                                                      bufferSize,
+                                                                                      vk::BufferUsageFlagBits::eTransferSrc,
+                                                                                      vk::MemoryPropertyFlagBits::eHostVisible,
+                                                                                      vk::MemoryPropertyFlagBits::eHostCoherent );
+      std::span<std::uint32_t const> indexData{ indices };
+      stagingBuffer.writeBytes( std::as_bytes( indexData ) );
 
-      indexBuffer =
-        createBuffer( bufferSize, vk::BufferUsageFlagBits::eTransferDst | vk::BufferUsageFlagBits::eIndexBuffer, vk::MemoryPropertyFlagBits::eDeviceLocal );
-      copyBuffer( stagingBuffer, indexBuffer );
+      indexBuffer.emplace( rendering::DeviceBuffer::create( physicalDevice,
+                                                            device,
+                                                            bufferSize,
+                                                            vk::BufferUsageFlagBits::eTransferDst | vk::BufferUsageFlagBits::eIndexBuffer,
+                                                            vk::MemoryPropertyFlagBits::eDeviceLocal ) );
+      copyBufferAndWait( stagingBuffer, *indexBuffer );
     }
 
     void transitionImageLayout( vk::CommandBuffer      commandBuffer,
@@ -1268,9 +1169,14 @@ namespace
       std::uint32_t const textureHeightUnsigned = static_cast<std::uint32_t>( textureHeight );
       textureMipLevels                          = static_cast<std::uint32_t>( std::bit_width( std::max( textureWidthUnsigned, textureHeightUnsigned ) ) );
 
-      DeviceBuffer stagingBuffer =
-        createBuffer( imageSize, vk::BufferUsageFlagBits::eTransferSrc, vk::MemoryPropertyFlagBits::eHostVisible, vk::MemoryPropertyFlagBits::eHostCoherent );
-      stagingBuffer.upload( device, pixels.get(), imageSize );
+      rendering::DeviceBuffer  stagingBuffer = rendering::DeviceBuffer::create( physicalDevice,
+                                                                                device,
+                                                                                imageSize,
+                                                                                vk::BufferUsageFlagBits::eTransferSrc,
+                                                                                vk::MemoryPropertyFlagBits::eHostVisible,
+                                                                                vk::MemoryPropertyFlagBits::eHostCoherent );
+      std::span<stbi_uc const> texturePixels{ pixels.get(), static_cast<std::size_t>( imageSize ) };
+      stagingBuffer.writeBytes( std::as_bytes( texturePixels ) );
 
       textureImage = createImage( textureWidthUnsigned,
                                   textureHeightUnsigned,
@@ -1294,7 +1200,7 @@ namespace
                                  vk::PipelineStageFlagBits::eTransfer,
                                  0,
                                  textureMipLevels );
-          copyBufferToImage( commandBuffer, *stagingBuffer.buffer, image, textureWidthUnsigned, textureHeightUnsigned );
+          copyBufferToImage( commandBuffer, stagingBuffer.handle(), image, textureWidthUnsigned, textureHeightUnsigned );
           generateMipmaps( commandBuffer, image, textureWidthUnsigned, textureHeightUnsigned );
         } );
     }
@@ -1333,8 +1239,12 @@ namespace
       uniformBuffers.reserve( MAX_FRAMES_IN_FLIGHT );
       for ( std::uint32_t frame = 0; frame < MAX_FRAMES_IN_FLIGHT; ++frame )
       {
-        uniformBuffers.push_back( createBuffer(
-          bufferSize, vk::BufferUsageFlagBits::eUniformBuffer, vk::MemoryPropertyFlagBits::eHostVisible, vk::MemoryPropertyFlagBits::eHostCoherent ) );
+        uniformBuffers.push_back( rendering::DeviceBuffer::create( physicalDevice,
+                                                                   device,
+                                                                   bufferSize,
+                                                                   vk::BufferUsageFlagBits::eUniformBuffer,
+                                                                   vk::MemoryPropertyFlagBits::eHostVisible,
+                                                                   vk::MemoryPropertyFlagBits::eHostCoherent ) );
       }
     }
 
@@ -1396,7 +1306,7 @@ namespace
       for ( std::size_t frame = 0; frame < descriptorSets.size(); ++frame )
       {
         vk::DescriptorBufferInfo const bufferInfo{
-          .buffer = *uniformBuffers[frame].buffer,
+          .buffer = uniformBuffers[frame].handle(),
           .offset = 0,
           .range  = sizeof( UniformBufferObject ),
         };
@@ -1756,10 +1666,10 @@ namespace
       commandBuffer.beginRenderPass( renderPassInfo, vk::SubpassContents::eInline );
       commandBuffer.bindPipeline( vk::PipelineBindPoint::eGraphics, *graphicsPipeline );
 
-      std::array<vk::Buffer, 1>               vertexBuffers = { *vertexBuffer.buffer };
+      std::array<vk::Buffer, 1>               vertexBuffers = { vertexBuffer->handle() };
       constexpr std::array<vk::DeviceSize, 1> offsets       = { 0 };
       commandBuffer.bindVertexBuffers( 0, vertexBuffers, offsets );
-      commandBuffer.bindIndexBuffer( *indexBuffer.buffer, 0, vk::IndexType::eUint32 );
+      commandBuffer.bindIndexBuffer( indexBuffer->handle(), 0, vk::IndexType::eUint32 );
 
       vk::DescriptorSet const descriptorSet = *descriptorSets[frameIndex];
       commandBuffer.bindDescriptorSets( vk::PipelineBindPoint::eGraphics, *pipelineLayout, 0, 1, &descriptorSet, 0, nullptr );
@@ -1816,7 +1726,7 @@ namespace
           glm::perspective( glm::radians( 45.0f ), static_cast<float>( swapChainExtent.width ) / static_cast<float>( swapChainExtent.height ), 0.1f, 10.0f ),
       };
       uniformBufferObject.proj[1][1] *= -1.0f;
-      uniformBuffers[frameIndex].upload( device, &uniformBufferObject, sizeof( uniformBufferObject ) );
+      uniformBuffers[frameIndex].writeBytes( std::as_bytes( std::span<UniformBufferObject const>{ &uniformBufferObject, 1 } ) );
     }
 
     [[nodiscard]] bool waitForUsableFramebuffer()
@@ -1982,14 +1892,14 @@ namespace
     vk::Format                        depthFormat = vk::Format::eUndefined;
     vk::SampleCountFlagBits           msaaSamples = vk::SampleCountFlagBits::e1;
 
-    DeviceBuffer               vertexBuffer;
-    DeviceBuffer               indexBuffer;
-    std::vector<DeviceBuffer>  uniformBuffers;
-    DeviceImage                textureImage;
-    vk::raii::Sampler          textureSampler;
-    std::uint32_t              textureMipLevels = 1;
-    std::vector<Vertex>        vertices;
-    std::vector<std::uint32_t> indices;
+    std::optional<rendering::DeviceBuffer> vertexBuffer;
+    std::optional<rendering::DeviceBuffer> indexBuffer;
+    std::vector<rendering::DeviceBuffer>   uniformBuffers;
+    DeviceImage                            textureImage;
+    vk::raii::Sampler                      textureSampler;
+    std::uint32_t                          textureMipLevels = 1;
+    std::vector<Vertex>                    vertices;
+    std::vector<std::uint32_t>             indices;
 
     vk::raii::DescriptorSetLayout         descriptorSetLayout;
     vk::raii::PipelineLayout              pipelineLayout;

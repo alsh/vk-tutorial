@@ -3,6 +3,12 @@
 This project follows the graphics path of the [Vulkan Tutorial](https://vulkan-tutorial.com/) in C++23 with Vulkan-Hpp RAII.
 The application renders a rotating, textured Viking Room model. It uses uniform buffers, descriptor sets, depth buffering, mipmaps, and multisampling.
 
+## Development direction
+
+This application is the first client of a small, Vulkan-specific rendering layer. The project will add reusable resource owners and operations in small steps, guided by concrete use cases and tests. It will not add unrelated game systems.
+
+The first refactoring step moves buffer ownership and checked host writes into a reusable type. It keeps GPU copy recording separate from submission and completion.
+
 The tutorial's separate compute-shader particle sample is not part of this graphics application.
 
 ## Dependencies
@@ -17,6 +23,7 @@ The tutorial's separate compute-shader particle sample is not part of this graph
 ```sh
 meson setup build -Dbuildtype=debug
 meson compile -C build
+meson test -C build --print-errorlogs
 (cd build && ./demo)
 ```
 

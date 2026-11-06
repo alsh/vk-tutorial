@@ -7,9 +7,10 @@ Read it before planning or changing code. Apply it to new code and to code chang
 for the current task. Existing code is not proof that a pattern is correct.
 
 This is a learning project based on the [Vulkan Tutorial](https://vulkan-tutorial.com/).
-The goal is a small, understandable Vulkan application written in modern C++.
-Keep the Vulkan operations visible. Do not turn the tutorial into a general game
-engine or a rendering framework.
+The first application is a small, understandable Vulkan program written in modern C++.
+The project will move incrementally toward reusable rendering components for a small
+engine. Keep Vulkan operations visible. Add each common entity or operation when a
+concrete use or invariant justifies it; do not build a complete engine at once.
 
 These directions do not define what "complete the project" means. Agree with the
 user on the required tutorial stage, features, and acceptance checks before that
@@ -17,10 +18,13 @@ work starts. A direct user instruction takes priority over these project default
 
 ## Current project map
 
-- `main.cc`: application startup, GLFW window, Vulkan resources, and rendering.
+- `main.cc`: application startup, GLFW window, scene updates, and renderer orchestration.
+- `device_buffer.hpp` and `device_buffer.cc`: buffer ownership, memory selection, checked host writes, and copy recording.
+- `vulkan_config.hpp`: shared Vulkan-Hpp and GLM configuration for each C++ translation unit.
 - `triangle.vert` and `red_triangle.frag`: GLSL shader sources.
 - `models/viking_room.obj` and `textures/viking_room.png`: sample assets. Meson copies them to the build directory.
-- `meson.build`: executable, dependencies, and shader compilation.
+- `tests/buffer_range_test.cc`: CPU-only tests for byte ranges and memory-type selection.
+- `meson.build`: application, dependencies, tests, and shader compilation.
 - `.clang-format`: authoritative C++ formatting configuration.
 - `README.md`: project purpose and user-facing build instructions.
 - `utils/` and root `utils.hpp`: copied NVIDIA sample utilities. They are not
@@ -62,8 +66,15 @@ cannot run, state the reason. Do not invent test results or hide failures.
   they make a Vulkan step easier to understand or test.
 - Use plain structs for data and small resource bundles. Use classes when private
   state and operations must maintain an invariant.
-- Keep the current single-executable structure. Split files when a concrete
-  responsibility warrants it, not to satisfy an arbitrary file-length limit.
+- Keep one application executable for the sample. Add small test executables when
+  they can test pure logic without a window or GPU.
+- Split code into functional units when a responsibility and its invariants justify
+  the boundary. Do not split files to satisfy an arbitrary length limit.
+- Build reusable rendering operations incrementally. Add an abstraction when a
+  second use or resource invariant justifies it. Keep Vulkan behavior explicit until
+  a second backend is a real requirement.
+- Research larger abstractions in bounded steps. Use a real client to define each
+  contract, then test a second use before generalizing it.
 - Keep application state local or owned by the application. Do not add mutable
   globals, singletons, hidden service registries, or generic `utils` collections.
 - Add dependencies only when the existing standard library and project libraries
@@ -256,8 +267,8 @@ meson compile -C build
 
 If `build/` already exists, inspect its configuration before reuse. Use a separate
 build directory if its paths or toolchain are stale. The dependency set includes
-Vulkan, GLFW, GLM, and `glslangValidator`, plus Meson, Ninja, and a suitable C++
-compiler and standard library.
+Vulkan, GLFW, GLM, `stb/stb_image.h`, and `glslangValidator`, plus Meson, Ninja, and a
+suitable C++ compiler and standard library.
 
 The current program reads shader files relative to the working directory. Run it
 from the build directory so it finds the generated shaders:
@@ -272,8 +283,9 @@ Until there is a task-approved asset-path change, do not claim that running
 Checks for relevant code changes:
 
 - Compile the executable and both shaders. Keep warning-as-error behavior.
-- Run applicable automated tests with `meson test -C build --print-errorlogs` when
-  tests exist. A run with no tests is not test coverage.
+- Run automated tests with `meson test -C build --print-errorlogs`.
+- The current buffer tests cover range and memory-type selection without a GPU.
+  A passing test run is not proof of correct rendering.
 - For rendering and lifetime changes, run a development build with validation.
   Check startup, rendering, repeated resize, minimize/restore, and normal close.
   Inspect validation output through shutdown, not just the first frame.
